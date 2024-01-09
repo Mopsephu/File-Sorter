@@ -1,0 +1,983 @@
+[gd_scene load_steps=8 format=3 uid="uid://ca88fg3yi1lkg"]
+
+[ext_resource type="FontFile" uid="uid://be3opqrmp8wvr" path="res://fonts/times.ttf" id="1_nju12"]
+
+[sub_resource type="GDScript" id="GDScript_j6q0s"]
+resource_name = "main logic"
+script/source = "extends Node2D
+
+@onready var folder_selector: FileDialog = $folderSelector;
+@onready var file_loader: FileDialog = $fileLoader;
+
+@onready var initial_text_edit: LineEdit = $\"%InitialTextEdit\";
+@onready var target_text_edit: LineEdit = $\"%TargetTextEdit\";
+@onready var path_check_box: CheckBox = $\"%PathCheckBox\";
+
+@onready var search_init_button: Button = $\"%SearchInitButton\";
+@onready var search_targ_button: Button = $\"%SearchTargButton\";
+@onready var sort_settings_button: Button = $\"%SortSettingsButton\";
+@onready var sort_button: Button = $\"%SortButton\";
+
+@onready var categories_container : VBoxContainer = $settings/VBoxContainer/ScrollContainer/VBoxContainer;
+
+@onready var load_category_button: Button = $settings/VBoxContainer/LoadCategoryButton;
+@onready var save_category_button: Button = $settings/VBoxContainer/SaveCategoryButton;
+
+
+@onready var delete_source_files_check_button: CheckButton = $%DeleteSourceFilesCheckButton;
+@onready var safe_erase_source_files_check_button: CheckButton = %SafeEraseSourceFilesCheckButton;
+@onready var create_missing_folders_check_button: CheckButton = $%CreateMissingFoldersCheckButton;
+@onready var delete_files_check_button: CheckButton = %DeleteFilesCheckButton;
+
+
+@onready var leave_loading_button: Button = %LeaveLoadingButton;
+@onready var process_label: Label = %ProcessLabel;
+@onready var process_progress_bar: ProgressBar = %ProcessProgressBar;
+
+
+const file_path : String = \"user://file_sorter.ini\";
+const settings_file_path : String = \"user://file_sorter_settings.ini\";
+
+var file_category : PackedScene = preload(\"res://scenes/file_category.tscn\");
+
+var dir_text : String = \"\";
+
+var path_selector : int = 0;
+var is_target_same : bool = false;
+
+#NOTE: В Packed...Array нет встроенного метода erase!
+func packedStringArray_erase(what : String, arr : PackedStringArray)->void:
+	return arr.remove_at(arr.find(what));
+
+func get_copy_of_packedStringArray(targ : PackedStringArray)->PackedStringArray:
+	var arr : PackedStringArray = [];
+	for elem : String in targ:
+		arr.append(elem);
+	return arr;
+
+func deselect_object(object : Control, mode_after : Control.FocusMode = Control.FOCUS_ALL)->void:
+	object.focus_mode = Control.FOCUS_NONE;
+	if mode_after != object.focus_mode:
+		object.focus_mode = mode_after;
+
+func _on_folder_selector_canceled() -> void:
+	path_selector = 0;
+	sort_button.disabled = false;
+	sort_settings_button.disabled = false;
+
+#region Получение пути до папки
+func _on_folder_selector_dir_selected(dir: String) -> void:
+	dir_text = dir;
+
+func _on_folder_selector_confirmed() -> void:
+	sort_button.disabled = false;
+	sort_settings_button.disabled = false;
+	match path_selector:
+		1:
+			if is_target_same:
+				target_text_edit.text = dir_text;
+			initial_text_edit.text = dir_text;
+		2:
+			target_text_edit.text = dir_text;
+	path_selector = 0;
+#endregion
+
+#region Переключение фокусов в зависимости от учёта пути
+func _on_path_check_box_toggled(toggled_on: bool) -> void:
+	is_target_same = toggled_on;
+	deselect_object(path_check_box);
+	if toggled_on:
+		target_text_edit.selecting_enabled = false;
+		target_text_edit.focus_mode = Control.FOCUS_NONE;
+		if path_selector == 0:
+			target_text_edit.text = initial_text_edit.text;
+	else:
+		target_text_edit.selecting_enabled = true;
+		target_text_edit.focus_mode = Control.FOCUS_ALL;
+	search_targ_button.disabled = toggled_on;
+	search_targ_button.focus_mode = target_text_edit.focus_mode;
+#endregion
+
+#region Вызов выбора папки
+func show_folder_selector(_path_selector : int)->void:
+	sort_button.disabled = true;
+	sort_settings_button.disabled = true;
+	path_selector = _path_selector;
+	match _path_selector:
+		1 when not initial_text_edit.text.is_empty():
+			folder_selector.current_dir = initial_text_edit.text;
+		2 when not target_text_edit.text.is_empty():
+			folder_selector.current_dir = target_text_edit.text;
+	folder_selector.visible = true;
+
+func _on_search_init_button_pressed() -> void:
+	deselect_object(search_init_button);
+	show_folder_selector(1);
+
+func _on_search_targ_button_pressed() -> void:
+	deselect_object(search_targ_button);
+	show_folder_selector(2);
+#endregion
+
+#region Переключение видимости \"сцен\"
+func switch_locations_visibilities(_invisible_ : Node2D, _visible_ : Node2D)->void:
+	_invisible_.visible = false;
+	_visible_.visible = true;
+
+func _on_sort_settings_button_pressed() -> void:
+	switch_locations_visibilities($basic, $settings);
+#endregion
+
+#Изменяет текст на экране загрузки
+func alert_message(message : String, alert : String = \"Подождите, идёт проверка на \", ending : String = \"...\")->void:
+	process_label.text = alert + message + ending;
+
+#region Загрузка/Сохранение категорий расширений файлов (В ОДНОМ ПОТОКЕ)
+func get_sum_of_extensions(is_loading_from_file : bool = false)->int:
+	var sum : int = 0;
+	if is_loading_from_file:
+		var save_file : ConfigFile = ConfigFile.new();
+		save_file.load(file_path);
+		for section : String in save_file.get_sections():
+			sum += save_file.get_value(section, \"file_extensions\", []).size();
+	else:
+		for category : VBoxContainer in categories_container.get_children():
+			sum += category.extension_amount;
+	return sum;
+
+func show_loading_screen(is_saving : bool)->void:
+	process_progress_bar.value = 0;
+	var sum : int = get_sum_of_extensions(!is_saving);
+	var text : String = \"сохранение\" if is_saving else \"загрузка\";
+	alert_message(text, \"Подождите, идёт \", \"расширений...\");
+	process_progress_bar.max_value = sum;
+	$loading_screen.visible = true;
+
+func hide_loading_screen(was_saving : bool)->void:
+	var text : String = \"Сохранение завершено\" if was_saving else \"Загрузка завершена\";
+	alert_message(\"\", text, \"!\");
+	await get_tree().create_timer(1).timeout;
+	$loading_screen.visible = false;
+	process_progress_bar.value = 0;
+	process_progress_bar.max_value = 100;
+
+func increase_bar()->void:
+	process_progress_bar.value += 1;
+
+func load_categories(default_path : String = file_path)->void:
+	var save_file : ConfigFile = ConfigFile.new();
+	save_file.load(default_path);
+	show_loading_screen(false);
+	for child : VBoxContainer in categories_container.get_children():
+		child.queue_free();
+	for section : String in save_file.get_sections():
+		var new_file_category : VBoxContainer = file_category.instantiate();
+		categories_container.add_child(new_file_category);
+		new_file_category.get_node(\"category_name\").text = section;
+		var file_extensions : PackedStringArray = save_file.get_value(section, \"file_extensions\", []);
+		for i : int in file_extensions.size():
+			new_file_category.add_extension();
+			new_file_category.get_node(\"ScrollContainer/VBoxContainer2\").get_child(i).get_node(\"file_extension\").text = file_extensions[i];
+			increase_bar();
+	hide_loading_screen(false);
+
+func save_categories(default_path : String = file_path)->void:
+	var save_file : ConfigFile = ConfigFile.new();
+	show_loading_screen(true);
+	for category : VBoxContainer in categories_container.get_children():
+		var extensions : PackedStringArray = [];
+		for extension : VBoxContainer in category.extension_container.get_children():
+			increase_bar();
+			extensions.append(extension.get_node(\"file_extension\").text);
+		save_file.set_value(category.get_node(\"category_name\").text, \"file_extensions\", extensions);
+	save_file.save(default_path);
+	hide_loading_screen(true);
+
+func _on_file_loader_file_selected(path: String) -> void:
+	load_categories(path);
+
+func _on_file_loader_confirmed() -> void:
+	if file_loader.file_mode == FileDialog.FILE_MODE_SAVE_FILE:
+		for drive_num : int in DirAccess.get_drive_count():
+			if DirAccess.dir_exists_absolute(DirAccess.get_drive_name(drive_num)+file_loader.current_dir):
+				save_categories(DirAccess.get_drive_name(drive_num)+file_loader.current_path);
+				load_categories(DirAccess.get_drive_name(drive_num)+file_loader.current_path);
+				break;
+#endregion
+
+#region Выход из настроек + проверка на ошибки
+func check_for_errors()->Vector3i:
+	#NOTE: (0, y, z) - ошибок нет, остальные значения X - есть
+	#NOTE: (x>0, 0, z) - ошибка в указанной категории
+	#NOTE: (x<0, y, 0) - ошибка в указанном расширении
+	alert_message(\"наличия названий в категориях\");
+	const max_step : int = 8;
+	process_progress_bar.max_value = max_step;
+	$loading_screen.visible = true;
+	var forbidden_symbols : PackedStringArray = [
+			\"CON\", \"PRN\", \"AUX\", \"NUL\", \"COM0\", \"COM1\", \"COM2\", \"COM3\",
+			\"COM4\", \"COM5\", \"COM6\", \"COM7\", \"COM8\", \"COM9\", \"LPT0\", \"LPT1\",
+			\"LPT2\", \"LPT3\", \"LPT4\", \"LPT5\", \"LPT6\", \"LPT7\", \"LPT8\", \"LPT9\",
+			\"<\", \">\", \":\", '\"', \"\\\"\".c_escape()[0], \"/\", \"|\", \"?\", \"*\"
+		];
+	#NOTE: 1 - в одной из существующих категорий отсутствует название категории
+	for i : int in categories_container.get_children().size():
+		var category : VBoxContainer = categories_container.get_child(i);
+		if category.get_node(\"category_name\").text == \"\":
+			return Vector3i(1, i, 0);
+	process_progress_bar.value += 1;
+	alert_message(\"отсутствия запрещённых символов в названиях в категорий\");
+	#NOTE: 2 - в названии категории присутствуют запрещённые символы/названия
+	for i : int in categories_container.get_children().size():
+		var category : VBoxContainer = categories_container.get_child(i);
+		for symbol : String in forbidden_symbols:
+			if symbol in category.get_node(\"category_name\").text:
+				return Vector3i(2, i, 0);
+	process_progress_bar.value += 1;
+	alert_message(\"отсутствия дубликатов названий в категориях\");
+	#NOTE: 3 - существует по-крайней мере 1 дубликат названия категории (папки)
+	var category_names : PackedStringArray = [];
+	for i : int in categories_container.get_children().size():
+		var category : VBoxContainer = categories_container.get_child(i);
+		if category.get_node(\"category_name\").text in category_names:
+			return Vector3i(3, i, 0);
+		else:
+			category_names.append(category.get_node(\"category_name\").text);
+	process_progress_bar.value += 1;
+	alert_message(\"наличия расширений в категориях\");
+	#NOTE: 4 - в одной из существующих категорий отсутствуют расширения
+	for i : int in categories_container.get_children().size():
+		var category : VBoxContainer = categories_container.get_child(i);
+		if category.extension_amount == 0:
+			return Vector3i(4, i, 0);
+	process_progress_bar.value += 1;
+	alert_message(\"наличия названий в расширениях\");
+	#NOTE: -1 - в одном из существующих расширений отсутствует имя
+	for i : int in categories_container.get_children().size():
+		var category : VBoxContainer = categories_container.get_child(i);
+		for j : int in category.extension_container.get_children().size():
+			var extension : VBoxContainer = category.extension_container.get_child(j);
+			if extension.get_node(\"file_extension\").text == \"\":
+				return Vector3i(-1, i, j);
+	process_progress_bar.value += 1;
+	alert_message(\"отсутствия запрещённых символов в расширениях\");
+	#NOTE: -2 - в названии одного из расширений присутствует по-крайней мере 1 запрещённый символ
+	for i : int in categories_container.get_children().size():
+		var category : VBoxContainer = categories_container.get_child(i);
+		for j : int in category.extension_container.get_children().size():
+			var extension : VBoxContainer = category.extension_container.get_child(j);
+			for symbol : String in forbidden_symbols:
+				if symbol in extension.get_node(\"file_extension\").text:
+					return Vector3i(-2, i, j);
+	process_progress_bar.value += 1;
+	alert_message(\"отсутствия дубликатов расширений в одной категории\");
+	#NOTE: -3 - в категории есть дубликат одного и того же расширения
+	for i : int in categories_container.get_children().size():
+		var category : VBoxContainer = categories_container.get_child(i);
+		@warning_ignore(\"confusable_local_declaration\")
+		var extensions : PackedStringArray = [];
+		for j : int in category.extension_container.get_children().size():
+			var extension : VBoxContainer = category.extension_container.get_child(j);
+			if extension.get_node(\"file_extension\").text in extensions:
+				return Vector3i(-3, i, j);
+			else:
+				extensions.append(extension.get_node(\"file_extension\").text);
+	process_progress_bar.value += 1;
+	alert_message(\"отсутствия дубликатов расширений в разных категориях\");
+	#NOTE: -4 - в нескольких категориях есть одно и то же расширение
+	var extensions : PackedStringArray = [];
+	for i : int in categories_container.get_children().size():
+		var category : VBoxContainer = categories_container.get_child(i);
+		for j : int in category.extension_container.get_children().size():
+			var extension : VBoxContainer = category.extension_container.get_child(j);
+			if extension.get_node(\"file_extension\").text in extensions:
+				return Vector3i(-4, i, j);
+			else:
+				extensions.append(extension.get_node(\"file_extension\").text);
+	process_progress_bar.value += 1;
+	return Vector3i(0, 0, 0);
+
+func _on_leave_settings_button_pressed() -> void:
+	save_settings();
+	var error_code : Vector3i = check_for_errors();
+	match error_code.x:
+		0:
+			alert_message(\"\", \"Проверка полностью пройдена\", \"!\");
+			await get_tree().create_timer(0.5).timeout;
+			save_categories();
+			switch_locations_visibilities($settings, $basic);
+		_:
+			#print(error_code);
+			var error_description : String = \"\";
+			var category_name : String = categories_container.get_child(error_code.y).get_node(\"category_name\").text;
+			var extension_name : String = categories_container.get_child(error_code.y).get_node(\"ScrollContainer/VBoxContainer2\").get_child(error_code.z).get_node(\"file_extension\").text if error_code.x < 0 else \"\";
+			match error_code.x:
+				1:
+					error_description += \"В категории под номером \" + str(error_code.y+1) + \" отсутствует название!\";
+				2:
+					error_description += \"В категории под номером \" + str(error_code.y+1) + \" присутствуют запрещённые символы!\";
+				3:
+					error_description += \"Категория с названием '\" + category_name + \"' уже существует!\";
+				4:
+					error_description += \"В категории '\" + category_name + \"' нет хотя бы одного расширения!\";
+				-1:
+					error_description += \"В категории '\" + category_name + \"' есть безымянное расширение!\";
+				-2:
+					error_description += \"В категории '\" + category_name + \"' есть расширение с запрещёнными символами!\";
+				-3:
+					error_description += \"В категории '\" + category_name + \"' обнаружены дубликаты расширения '\" + extension_name + \"'!\";
+				-4:
+					error_description += \"В категории '\" + category_name + \"' обнаружен дубликат расширения '\" + extension_name + \"', который уже существует в категории выше!\";
+			var extension_pos : String = \"\\nНомер расширения: \" + str(error_code.z+1) if error_code.x < 0 else \"\";
+			alert_message(error_description, \"Проверка была провалена!\\n\", \"\\nНомер категории: \" + str(error_code.y+1) + extension_pos);
+			$loading_screen/LeaveLoadingButton.visible = true;
+#endregion
+
+#region Загрузка/Сохранение настроек программы
+func _on_delete_files_check_button_pressed() -> void:
+	delete_source_files_check_button.disabled = delete_files_check_button.button_pressed;
+	deselect_object(delete_source_files_check_button, Control.FOCUS_NONE) if delete_files_check_button.button_pressed else deselect_object(delete_source_files_check_button);
+	delete_source_files_check_button.button_pressed = false;
+	
+	if delete_source_files_check_button.disabled:
+		safe_erase_source_files_check_button.disabled = false;
+	elif !delete_source_files_check_button.button_pressed:
+		safe_erase_source_files_check_button.disabled = true;
+	deselect_object(safe_erase_source_files_check_button) if delete_files_check_button.button_pressed else deselect_object(safe_erase_source_files_check_button, safe_erase_source_files_check_button.focus_mode);
+	
+	path_check_box.button_pressed = delete_files_check_button.button_pressed;
+	path_check_box.disabled = delete_files_check_button.button_pressed;
+	_on_path_check_box_toggled(delete_files_check_button.button_pressed);
+	deselect_object(path_check_box, Control.FOCUS_NONE) if delete_files_check_button.button_pressed else deselect_object(path_check_box);
+	
+	search_targ_button.disabled = delete_files_check_button.button_pressed;
+	deselect_object(search_targ_button, Control.FOCUS_NONE) if delete_files_check_button.button_pressed else deselect_object(search_targ_button);
+	
+	target_text_edit.editable = !delete_files_check_button.button_pressed;
+	target_text_edit.selecting_enabled = !delete_files_check_button.button_pressed;
+	target_text_edit.text = initial_text_edit.text;
+	deselect_object(target_text_edit, Control.FOCUS_NONE) if delete_files_check_button.button_pressed else deselect_object(target_text_edit);
+
+
+func load_settings()->void:
+	var settings_file : ConfigFile = ConfigFile.new();
+	const section : String = \"settings\";
+	settings_file.load(settings_file_path);
+	delete_source_files_check_button.button_pressed = settings_file.get_value(section, \"delete_source_files\", false);
+	create_missing_folders_check_button.button_pressed = settings_file.get_value(section, \"create_missing_folders\", true);
+	safe_erase_source_files_check_button.disabled = !delete_source_files_check_button.button_pressed
+	safe_erase_source_files_check_button.button_pressed = settings_file.get_value(section, \"safe_erase_source_files\", true);
+	deselect_object(safe_erase_source_files_check_button, Control.FOCUS_NONE) if safe_erase_source_files_check_button.disabled else deselect_object(safe_erase_source_files_check_button);
+	delete_files_check_button.button_pressed = settings_file.get_value(section, \"delete_files\", false);
+	_on_delete_files_check_button_pressed();
+	
+
+func save_settings()->void:
+	var settings_file : ConfigFile = ConfigFile.new();
+	const section : String = \"settings\";
+	settings_file.set_value(section, \"delete_source_files\", delete_source_files_check_button.button_pressed);
+	settings_file.set_value(section, \"create_missing_folders\", create_missing_folders_check_button.button_pressed);
+	settings_file.set_value(section, \"safe_erase_source_files\", safe_erase_source_files_check_button.button_pressed);
+	settings_file.set_value(section, \"delete_files\", delete_files_check_button.button_pressed);
+	
+	settings_file.save(settings_file_path);
+#endregion
+
+#region Сортировка файлов по указанным настройкам
+func sort_files()->void:
+	alert_message(\"существование путей\");
+	process_progress_bar.value = 0;
+	process_progress_bar.max_value = 100;
+	$loading_screen.visible = true;
+	#Проверка на доступность путей
+	if DirAccess.dir_exists_absolute(initial_text_edit.text) and DirAccess.dir_exists_absolute(target_text_edit.text) and initial_text_edit.text != \"\" and target_text_edit.text != \"\":
+		alert_message(\"доступность путей\");
+		var init_dir : DirAccess = DirAccess.open(initial_text_edit.text);
+		var targ_dir : DirAccess = DirAccess.open(target_text_edit.text);
+		if init_dir and targ_dir:
+			#Различные лямбда-функции
+			var get_extension : Callable = func(filename : String)->String:
+				return filename.right(-filename.rfind(\".\")-1);
+			var get_difference : Callable = func(full_arr : PackedStringArray, targ_arr : PackedStringArray)->PackedStringArray:
+				var result : PackedStringArray = [];
+				for elem : String in full_arr:
+					if not elem in targ_arr:
+						result.append(elem);
+				return result;
+			alert_message(\"\", \"Подождите, идёт подсчёт целевых файлов\");
+			#Загрузка указанных расширений и категорий в удобный словарь
+			var allowed_extensions : Dictionary = {};
+			for i : int in categories_container.get_children().size():
+				var category : VBoxContainer = categories_container.get_child(i);
+				var extensions : PackedStringArray = [];
+				for j : int in category.extension_container.get_children().size():
+					var extension : VBoxContainer = category.extension_container.get_child(j);
+					extensions.append(extension.get_node(\"file_extension\").text);
+				allowed_extensions[category.get_node(\"category_name\").text] = extensions;
+			if allowed_extensions.is_empty():
+				alert_message(\"Добавьте хотя бы одну в настройках или, если выключена возможность создавать отсутствующие папки, создайте хотя бы одну самостоятельно!\", \"Сортировка невозможна без целевых категорий!\\n\", \"\");
+				leave_loading_button.visible = true;
+				return;
+			#Создание категорий, если позволяет настройка
+			var files_to_be_canceled : PackedStringArray = [];
+			var source_files : PackedStringArray = DirAccess.get_files_at(initial_text_edit.text);
+			if create_missing_folders_check_button.button_pressed:
+				for foldername : String in allowed_extensions.keys():
+					if not targ_dir.dir_exists(foldername): targ_dir.make_dir(foldername);
+			else:
+				#NOTE: А что, если сделать так, чтобы удаление тоже 
+				#происходило по принципу обнаружения папок? Тогда по результатам очистки папки
+				#должны также удаляться.
+				
+				#Иначе идёт фильтрация тех файлов, что не войдут в те или иные папки даже если они подходят по настройкам
+				for filename : String in source_files:
+					for category_name : String in allowed_extensions.keys():
+						if get_extension.call(filename) in allowed_extensions[category_name] and not targ_dir.dir_exists(category_name):
+							files_to_be_canceled.append(filename);
+			#Удаление ненужных файлов из списка
+			for i : int in source_files.size():
+				var file_extension : String = get_extension.call(source_files[i]);
+				var foundExtension : bool = false;
+				for extensions : PackedStringArray in allowed_extensions.values():
+					if file_extension in extensions:
+						foundExtension = true;
+						break;
+				if !foundExtension: files_to_be_canceled.append(source_files[i]);
+			#NOTE: НЕ ТРОГАТЬ ЦИКЛ НИЖЕ! Я ХЗ КАК ОН ДО ЭТОГО НЕ РАБОТАЛ И ПОЧЕМУ СЕЙЧАС РАБОТАЕТ!
+			var allowed_files : PackedStringArray = [];
+			for i : int in source_files.size():
+				if not source_files[i] in files_to_be_canceled:
+					allowed_files.append(source_files[i]);
+			#Для подсчёта общего количества файлов
+			process_progress_bar.max_value = allowed_files.size();
+			if allowed_files.size() > 0:
+				#Перемещение файлов с применёнными настройками
+				alert_message(initial_text_edit.text, \"Подождите, идёт сортировка из \", \" в \" + target_text_edit.text + \"...\") if not delete_files_check_button.button_pressed else alert_message(\"по пути: \" + initial_text_edit.text, \"Подождите, идёт удаление целевых файлов \");
+				init_dir.list_dir_begin();
+				var file_name : String = init_dir.get_next();
+				var files_before : PackedStringArray = get_copy_of_packedStringArray(allowed_files);
+				while file_name != \"\":
+					if not init_dir.current_is_dir():
+						#Обнаружен нужный файл
+						if file_name in allowed_files:
+							var file_extension : String = get_extension.call(file_name);
+							for category : String in allowed_extensions.keys():
+								if file_extension in allowed_extensions[category] and targ_dir.dir_exists(category):
+									var source_abs_path : String = initial_text_edit.text+\"/\"+file_name;
+									if !delete_files_check_button.button_pressed:
+										if DirAccess.copy_absolute(source_abs_path, target_text_edit.text+\"/\"+category+\"/\"+file_name) == OK:
+											packedStringArray_erase(file_name, allowed_files);
+									else:
+										if safe_erase_source_files_check_button.button_pressed:
+											if OS.move_to_trash(source_abs_path) == OK:
+												packedStringArray_erase(file_name, allowed_files);
+										else:
+											if DirAccess.remove_absolute(source_abs_path) == OK:
+												packedStringArray_erase(file_name, allowed_files);
+									process_progress_bar.value += 1;
+									break;
+					file_name = init_dir.get_next();
+				init_dir.list_dir_end();
+				#Удаление использованных папок, которые по плану должны оставаться пустыми.
+				#Да, шинигами тут не нужны.
+				if delete_files_check_button.pressed:
+					for category : String in allowed_extensions.keys():
+						var category_path : String = target_text_edit.text + \"/\" + category;
+						if DirAccess.dir_exists_absolute(category_path) and DirAccess.get_files_at(category_path).size() == 0:
+							DirAccess.remove_absolute(category_path);
+				if delete_source_files_check_button.button_pressed:
+					alert_message(\"\", \"Подождите, идёт удаление исходных файлов\");
+					var sorted_files : PackedStringArray = get_difference.call(files_before, allowed_files);
+					process_progress_bar.value = 0;
+					process_progress_bar.max_value = sorted_files.size();
+					for sorted_file_name : String in sorted_files:
+						var source_file_path : String = initial_text_edit.text+\"/\"+sorted_file_name;
+						if safe_erase_source_files_check_button.button_pressed:
+							OS.move_to_trash(source_file_path);
+						else:
+							DirAccess.remove_absolute(source_file_path);
+						process_progress_bar.value += 1;
+				var error_message : String = \"Некоторые из файлов по неизвестной причине не удалось переместить: \" + str(allowed_files) if allowed_files.size() > 0 else \"\";
+				alert_message(error_message, \"Сортировка завершена!\\n\", \"\");
+				leave_loading_button.visible = true;
+			else:
+				alert_message(initial_text_edit.text, \"Не нашлось ни одного файла, соответствующего заданным параметрам по пути\\n'\", \"'!\");
+				leave_loading_button.visible = true;
+		else:
+			var init_path : String = initial_text_edit.text + \"\\n\" if not init_dir else \"\";
+			var targ_path : String = target_text_edit.text if not targ_dir else \"\";
+			alert_message(init_path + targ_path, \"При попытке открыть папки возникла ошибка доступа:\\n\", \"\");
+			leave_loading_button.visible = true;
+	else:
+		var nonexistingPath : String = initial_text_edit.text if not DirAccess.dir_exists_absolute(initial_text_edit.text) else target_text_edit.text;
+		alert_message(\"Пути '\" + nonexistingPath + \"'\", \"Ошибка сортировки!\\n\", \" не существует!\");
+		leave_loading_button.visible = true;
+#endregion
+
+func _ready() -> void:
+	$basic/version.text = \"Версия: \" + ProjectSettings.get_setting(\"application/config/version\", \"1.0.0\");
+	folder_selector.current_dir = \"/\";
+	file_loader.current_dir = \"/\";
+	#Лямбда-функция переключает возможность взаимодействовать с теми же самыми кнопками
+	var able_objects : Callable = func(mode_after : Control.FocusMode)->void:
+		deselect_object(sort_settings_button, mode_after);
+		deselect_object(sort_button, mode_after);
+	#Отключаем возможность взаимодействовать с кнопками
+	able_objects.bind(Control.FOCUS_NONE);
+	#Запускаем в ОСНОВНОМ потоке загрузку категорий и расширений, потому что \"на моём компе не работает\"
+	load_categories();
+	#Загружаем файл настроек
+	load_settings();
+	#Подключаем сигналы кнопок к нужным функциям
+	$settings/VBoxContainer/AddCategoryButton.pressed.connect(func()->void:
+		$settings/VBoxContainer/ScrollContainer/VBoxContainer.add_child(file_category.instantiate());
+		);
+	leave_loading_button.pressed.connect(func()->void:
+		leave_loading_button.visible = false;
+		$loading_screen.visible = false;
+		);
+	delete_source_files_check_button.pressed.connect(func()->void:
+		safe_erase_source_files_check_button.disabled = !delete_source_files_check_button.button_pressed;
+		if safe_erase_source_files_check_button.disabled:
+			deselect_object(safe_erase_source_files_check_button, Control.FOCUS_NONE);
+		else:
+			deselect_object(safe_erase_source_files_check_button);
+		)
+	load_category_button.pressed.connect(func()->void:
+		file_loader.file_mode = FileDialog.FILE_MODE_OPEN_FILE;
+		file_loader.ok_button_text = \"Открыть\";
+		file_loader.visible = true;
+		)
+	save_category_button.pressed.connect(func()->void:
+		file_loader.file_mode = FileDialog.FILE_MODE_SAVE_FILE;
+		file_loader.ok_button_text = \"Сохранить\";
+		file_loader.visible = true;
+		)
+	sort_button.pressed.connect(sort_files);
+	#Возвращаем возможность взаимодействовать с кнопками
+	able_objects.bind(Control.FOCUS_ALL);
+"
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_ojga5"]
+bg_color = Color(0, 0.156863, 0.286275, 1)
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_o1keh"]
+bg_color = Color(0.152941, 0.152941, 0.152941, 1)
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_fv2k0"]
+bg_color = Color(0.352941, 0.368627, 0.376471, 1)
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_1itos"]
+bg_color = Color(0.14902, 0.14902, 0.14902, 1)
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_0bh70"]
+bg_color = Color(0, 0.678431, 0.552941, 1)
+
+[node name="main" type="Node2D"]
+script = SubResource("GDScript_j6q0s")
+
+[node name="background" type="Panel" parent="."]
+offset_right = 1152.0
+offset_bottom = 648.0
+theme_override_styles/panel = SubResource("StyleBoxFlat_ojga5")
+metadata/_edit_lock_ = true
+
+[node name="basic" type="Node2D" parent="."]
+
+[node name="prog_name" type="Label" parent="basic"]
+offset_right = 1152.0
+offset_bottom = 129.0
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 12
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 56
+text = "Сортировщик
+файлов"
+horizontal_alignment = 1
+autowrap_mode = 3
+uppercase = true
+metadata/_edit_lock_ = true
+
+[node name="initial_folder_text" type="Label" parent="basic"]
+offset_left = 216.0
+offset_top = 184.0
+offset_right = 384.0
+offset_bottom = 256.0
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 10
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 50
+text = "Откуда:"
+horizontal_alignment = 2
+autowrap_mode = 3
+
+[node name="InitialTextEdit" type="LineEdit" parent="basic"]
+unique_name_in_owner = true
+offset_left = 384.0
+offset_top = 192.0
+offset_right = 832.0
+offset_bottom = 256.0
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 36
+placeholder_text = "Путь"
+
+[node name="target_folder_text" type="Label" parent="basic"]
+offset_left = 216.0
+offset_top = 312.0
+offset_right = 384.0
+offset_bottom = 384.0
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 10
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 50
+text = "Куда:"
+horizontal_alignment = 2
+autowrap_mode = 3
+
+[node name="TargetTextEdit" type="LineEdit" parent="basic"]
+unique_name_in_owner = true
+offset_left = 384.0
+offset_top = 320.0
+offset_right = 832.0
+offset_bottom = 384.0
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 36
+placeholder_text = "Путь"
+
+[node name="PathCheckBox" type="CheckBox" parent="basic"]
+unique_name_in_owner = true
+offset_left = 856.0
+offset_top = 320.0
+offset_right = 1088.0
+offset_bottom = 384.0
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 8
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 40
+text = "Тот же путь"
+
+[node name="SortButton" type="Button" parent="basic"]
+unique_name_in_owner = true
+offset_left = 464.0
+offset_top = 552.0
+offset_right = 686.0
+offset_bottom = 616.0
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 7
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 40
+text = "Сортировать"
+
+[node name="SortSettingsButton" type="Button" parent="basic"]
+unique_name_in_owner = true
+offset_left = 464.0
+offset_top = 448.0
+offset_right = 686.0
+offset_bottom = 512.0
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 7
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 40
+text = "Настройки"
+
+[node name="SearchInitButton" type="Button" parent="basic"]
+unique_name_in_owner = true
+offset_left = 32.0
+offset_top = 192.0
+offset_right = 192.0
+offset_bottom = 256.0
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 7
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 40
+text = "Обзор"
+
+[node name="SearchTargButton" type="Button" parent="basic"]
+unique_name_in_owner = true
+offset_left = 32.0
+offset_top = 320.0
+offset_right = 192.0
+offset_bottom = 384.0
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 7
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 40
+text = "Обзор"
+
+[node name="version" type="Label" parent="basic"]
+offset_left = 936.0
+offset_top = 576.0
+offset_right = 1152.0
+offset_bottom = 648.0
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 10
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 37
+text = "Версия 0.1.0"
+horizontal_alignment = 1
+vertical_alignment = 1
+autowrap_mode = 3
+
+[node name="folderSelector" type="FileDialog" parent="."]
+disable_3d = true
+title = "Выбор папки"
+initial_position = 1
+size = Vector2i(800, 400)
+ok_button_text = "Выбрать текущую папку"
+cancel_button_text = "Отмена"
+mode_overrides_title = false
+file_mode = 2
+access = 2
+
+[node name="settings" type="Node2D" parent="."]
+visible = false
+
+[node name="VBoxContainer" type="VBoxContainer" parent="settings"]
+clip_contents = true
+custom_minimum_size = Vector2(250, 50)
+offset_left = 8.0
+offset_right = 264.0
+offset_bottom = 646.0
+size_flags_horizontal = 7
+size_flags_vertical = 9
+
+[node name="Label" type="Label" parent="settings/VBoxContainer"]
+layout_mode = 2
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 8
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 30
+text = "Папки сортировки"
+horizontal_alignment = 1
+
+[node name="LoadCategoryButton" type="Button" parent="settings/VBoxContainer"]
+layout_mode = 2
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 28
+theme_override_styles/normal = SubResource("StyleBoxFlat_o1keh")
+text = "Загрузить категории"
+
+[node name="SaveCategoryButton" type="Button" parent="settings/VBoxContainer"]
+layout_mode = 2
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 28
+theme_override_styles/normal = SubResource("StyleBoxFlat_o1keh")
+text = "Сохранить категории"
+
+[node name="AddCategoryButton" type="Button" parent="settings/VBoxContainer"]
+layout_mode = 2
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 28
+theme_override_styles/normal = SubResource("StyleBoxFlat_o1keh")
+text = "Добавить категорию"
+
+[node name="ScrollContainer" type="ScrollContainer" parent="settings/VBoxContainer"]
+custom_minimum_size = Vector2(250, 500)
+layout_mode = 2
+size_flags_horizontal = 5
+size_flags_vertical = 2
+follow_focus = true
+horizontal_scroll_mode = 0
+
+[node name="VBoxContainer" type="VBoxContainer" parent="settings/VBoxContainer/ScrollContainer"]
+clip_contents = true
+custom_minimum_size = Vector2(0, 250)
+layout_mode = 2
+size_flags_horizontal = 3
+size_flags_vertical = 3
+
+[node name="LeaveSettingsButton" type="Button" parent="settings"]
+offset_left = 400.0
+offset_top = 576.0
+offset_right = 744.0
+offset_bottom = 640.0
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 28
+theme_override_styles/normal = SubResource("StyleBoxFlat_o1keh")
+text = "Выйти из настроек"
+
+[node name="AfterSortingLabel" type="Label" parent="settings"]
+offset_left = 320.0
+offset_right = 576.0
+offset_bottom = 71.0
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 8
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 30
+text = "Действия после сортировки"
+horizontal_alignment = 1
+autowrap_mode = 3
+
+[node name="ActionsAfter" type="Node2D" parent="settings"]
+
+[node name="DeleteSourceFilesCheckButton" type="CheckButton" parent="settings/ActionsAfter"]
+unique_name_in_owner = true
+offset_left = 296.0
+offset_top = 88.0
+offset_right = 608.0
+offset_bottom = 160.0
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 7
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 25
+text = "Удалить исходные
+файлы"
+alignment = 1
+
+[node name="SafeEraseSourceFilesCheckButton" type="CheckButton" parent="settings/ActionsAfter"]
+unique_name_in_owner = true
+offset_left = 296.0
+offset_top = 160.0
+offset_right = 608.0
+offset_bottom = 232.0
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 7
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 25
+button_pressed = true
+text = "Безопасное удаление
+исходных файлов"
+alignment = 1
+
+[node name="WhileSortingLabel" type="Label" parent="settings"]
+offset_left = 608.0
+offset_right = 864.0
+offset_bottom = 71.0
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 8
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 30
+text = "Действия при сортировке"
+horizontal_alignment = 1
+autowrap_mode = 3
+
+[node name="ActionsWhile" type="Node2D" parent="settings"]
+
+[node name="DeleteFilesCheckButton" type="CheckButton" parent="settings/ActionsWhile"]
+unique_name_in_owner = true
+offset_left = 632.0
+offset_top = 88.0
+offset_right = 839.0
+offset_bottom = 160.0
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 7
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 25
+text = "Удалять файлы"
+alignment = 1
+
+[node name="BeforeSortingLabel" type="Label" parent="settings"]
+offset_left = 880.0
+offset_right = 1136.0
+offset_bottom = 71.0
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 8
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 30
+text = "Действия до сортировки"
+horizontal_alignment = 1
+autowrap_mode = 3
+
+[node name="ActionsBefore" type="Node2D" parent="settings"]
+
+[node name="CreateMissingFoldersCheckButton" type="CheckButton" parent="settings/ActionsBefore"]
+unique_name_in_owner = true
+offset_left = 894.0
+offset_top = 72.0
+offset_right = 1138.0
+offset_bottom = 167.0
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 7
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 25
+text = "Создать папки
+при
+их отсутствии"
+alignment = 1
+
+[node name="fileLoader" type="FileDialog" parent="."]
+title = "Файл категорий"
+initial_position = 2
+size = Vector2i(1138, 612)
+ok_button_text = "Сохранить"
+cancel_button_text = "Отмена"
+mode_overrides_title = false
+access = 2
+filters = PackedStringArray("*.ini")
+
+[node name="loading_screen" type="Node2D" parent="."]
+visible = false
+
+[node name="Panel" type="Panel" parent="loading_screen"]
+custom_minimum_size = Vector2(0, 488)
+offset_right = 1152.0
+offset_bottom = 648.0
+theme_override_styles/panel = SubResource("StyleBoxFlat_fv2k0")
+metadata/_edit_lock_ = true
+
+[node name="ScrollContainer" type="ScrollContainer" parent="loading_screen"]
+clip_contents = false
+custom_minimum_size = Vector2(1152, 430)
+offset_right = 1152.0
+offset_bottom = 430.0
+horizontal_scroll_mode = 0
+
+[node name="VBoxContainer" type="VBoxContainer" parent="loading_screen/ScrollContainer"]
+custom_minimum_size = Vector2(1140, 430)
+layout_mode = 2
+size_flags_vertical = 0
+
+[node name="ProcessLabel" type="Label" parent="loading_screen/ScrollContainer/VBoxContainer"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(550, 400)
+layout_mode = 2
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 7
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 25
+text = "Подождите, идёт "
+horizontal_alignment = 1
+vertical_alignment = 1
+autowrap_mode = 3
+
+[node name="ProcessProgressBar" type="ProgressBar" parent="loading_screen"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(640, 0)
+offset_left = 256.0
+offset_top = 456.0
+offset_right = 896.0
+offset_bottom = 496.0
+size_flags_horizontal = 4
+size_flags_vertical = 2
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 5
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 35
+theme_override_styles/background = SubResource("StyleBoxFlat_1itos")
+theme_override_styles/fill = SubResource("StyleBoxFlat_0bh70")
+
+[node name="LeaveLoadingButton" type="Button" parent="loading_screen"]
+unique_name_in_owner = true
+visible = false
+offset_left = 400.0
+offset_top = 512.0
+offset_right = 744.0
+offset_bottom = 576.0
+theme_override_fonts/font = ExtResource("1_nju12")
+theme_override_font_sizes/font_size = 28
+theme_override_styles/normal = SubResource("StyleBoxFlat_o1keh")
+text = "Обратно"
+
+[connection signal="toggled" from="basic/PathCheckBox" to="." method="_on_path_check_box_toggled"]
+[connection signal="pressed" from="basic/SortSettingsButton" to="." method="_on_sort_settings_button_pressed"]
+[connection signal="pressed" from="basic/SearchInitButton" to="." method="_on_search_init_button_pressed"]
+[connection signal="pressed" from="basic/SearchTargButton" to="." method="_on_search_targ_button_pressed"]
+[connection signal="canceled" from="folderSelector" to="." method="_on_folder_selector_canceled"]
+[connection signal="confirmed" from="folderSelector" to="." method="_on_folder_selector_confirmed"]
+[connection signal="dir_selected" from="folderSelector" to="." method="_on_folder_selector_dir_selected"]
+[connection signal="pressed" from="settings/LeaveSettingsButton" to="." method="_on_leave_settings_button_pressed"]
+[connection signal="pressed" from="settings/ActionsWhile/DeleteFilesCheckButton" to="." method="_on_delete_files_check_button_pressed"]
+[connection signal="confirmed" from="fileLoader" to="." method="_on_file_loader_confirmed"]
+[connection signal="file_selected" from="fileLoader" to="." method="_on_file_loader_file_selected"]

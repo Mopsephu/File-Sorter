@@ -1,0 +1,81 @@
+[gd_scene load_steps=6 format=3 uid="uid://bbx6prwt872u1"]
+
+[ext_resource type="FontFile" uid="uid://be3opqrmp8wvr" path="res://fonts/times.ttf" id="1_bj3ar"]
+
+[sub_resource type="GDScript" id="GDScript_dtx3v"]
+resource_name = "file category logic"
+script/source = "extends VBoxContainer
+
+@onready var extension_container : VBoxContainer = $ScrollContainer/VBoxContainer2;
+
+var extension : PackedScene = preload(\"res://scenes/file_extension_container.tscn\");
+
+var extension_amount : int = 0;
+
+func delete_itself()->void:
+	queue_free();
+
+func add_extension()->void:
+	var new_extension : VBoxContainer = extension.instantiate();
+	extension_container.add_child(new_extension);
+	extension_amount = extension_container.get_child_count();
+
+func _ready() -> void:
+	$DeleteCategoryButton.pressed.connect(delete_itself);
+	$AddExtensionButton.pressed.connect(add_extension);
+"
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_o1keh"]
+bg_color = Color(0.152941, 0.152941, 0.152941, 1)
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_l4xxf"]
+bg_color = Color(0, 1, 0.431373, 1)
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_yum5k"]
+bg_color = Color(1, 1, 1, 1)
+
+[node name="category" type="VBoxContainer"]
+size_flags_vertical = 2
+script = SubResource("GDScript_dtx3v")
+
+[node name="category_name" type="LineEdit" parent="."]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.898039, 1, 0, 1)
+theme_override_colors/font_placeholder_color = Color(0.898039, 1, 0, 0.407843)
+theme_override_fonts/font = ExtResource("1_bj3ar")
+theme_override_font_sizes/font_size = 30
+placeholder_text = "Имя категории"
+alignment = 1
+
+[node name="DeleteCategoryButton" type="Button" parent="."]
+layout_mode = 2
+theme_override_fonts/font = ExtResource("1_bj3ar")
+theme_override_font_sizes/font_size = 24
+theme_override_styles/normal = SubResource("StyleBoxFlat_o1keh")
+text = "Удалить категорию"
+
+[node name="AddExtensionButton" type="Button" parent="."]
+layout_mode = 2
+theme_override_fonts/font = ExtResource("1_bj3ar")
+theme_override_font_sizes/font_size = 24
+theme_override_styles/normal = SubResource("StyleBoxFlat_o1keh")
+text = "Добавить расширение"
+
+[node name="Panel2" type="Panel" parent="."]
+custom_minimum_size = Vector2(0, 5)
+layout_mode = 2
+theme_override_styles/panel = SubResource("StyleBoxFlat_l4xxf")
+
+[node name="ScrollContainer" type="ScrollContainer" parent="."]
+custom_minimum_size = Vector2(0, 97)
+layout_mode = 2
+size_flags_vertical = 0
+horizontal_scroll_mode = 0
+
+[node name="VBoxContainer2" type="VBoxContainer" parent="ScrollContainer"]
+layout_mode = 2
+
+[node name="Panel" type="Panel" parent="."]
+custom_minimum_size = Vector2(0, 10)
+layout_mode = 2
+theme_override_styles/panel = SubResource("StyleBoxFlat_yum5k")
